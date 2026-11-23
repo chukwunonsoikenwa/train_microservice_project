@@ -257,7 +257,11 @@ jobs:
             exit 0
           fi
 
-          echo "::error::The build failed (not a timeout). Nothing deployed; the cluster keeps the current release."
+          if [ "$RETAG" = failure ]; then
+            echo "::error::Retagging failed: some images don't exist in GHCR yet. Run the workflow from the Actions tab with 'Rebuild all 50 images' ticked."
+          else
+            echo "::error::The build failed (not a timeout). Nothing deployed; the cluster keeps the current release."
+          fi
           exit 1
 
       # 2 ─────────────────────────────────────────────────────────────────────
