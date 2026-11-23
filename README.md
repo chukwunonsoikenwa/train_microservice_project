@@ -1,6 +1,6 @@
 # 🚆 RailShack on AWS EKS
 
-An IRCTC-style train booking platform made of **50 microservices**, deployed to **Amazon EKS (Auto Mode)** with **one Helm chart**, shipped by a **GitHub Actions** pipeline that builds, scans, deploys and smoke-tests every release.
+A train booking platform made of **50 microservices**, deployed to **Amazon EKS (Auto Mode)** with **one Helm chart**, shipped by a **GitHub Actions** pipeline that builds, scans, deploys and smoke-tests every release.
 
 **Live:** https://railshack.nonsoikenwa.live · **Grafana:** https://grafana.railshack.nonsoikenwa.live
 
