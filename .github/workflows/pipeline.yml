@@ -349,6 +349,11 @@ jobs:
       - name: Roll back if the smoke test failed
         if: failure() && steps.smoke.outcome == 'failure'
         run: |
+          revisions=$(helm history "$RELEASE" -n "$NAMESPACE" -o json | jq length)
+          if [ "$revisions" -le 1 ]; then
+            echo "::warning::Smoke test failed, but this is the first release, so there is no earlier version to roll back to. Leaving it running so you can debug it."
+            exit 0
+          fi
           echo "::error::Smoke test failed on the new release. Rolling back."
           helm rollback "$RELEASE" -n "$NAMESPACE" --wait --timeout 10m
           helm history "$RELEASE" -n "$NAMESPACE" --max 5
