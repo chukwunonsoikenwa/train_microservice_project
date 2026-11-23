@@ -1,0 +1,350 @@
+# RailShack CI/CD: build → Trivy → push to GHCR → deploy to EKS → smoke test through the ALB.
+#
+#   plan     works out which of the 50 images this commit changed (scripts/ci/plan.py) and the release tag
+#   build    one job per changed service: docker build → Trivy (CRITICAL = stop) → push amd64 + arm64
+#   retag    gives the unchanged images the same tag, so one tag = one complete release of all 50
+#   deploy   1 pick the tag · 2 AWS login (OIDC) · 3 kubeconfig · 4 monitoring + pull secret
+#            5 helm upgrade (rolls back on failure) · 6 smoke test through the real ALB
+#
+# Rules
+#   - Trivy finds a CRITICAL vulnerability  → the pipeline stops, nothing is deployed.
+#   - The build runs past 15 minutes        → the new release is dropped and the last stable
+#                                             release (the one running on EKS) is redeployed and smoke-tested.
+#   - helm upgrade or the smoke test fails  → Helm rolls back to the previous release.
+#
+# Repository settings needed (Settings → Secrets and variables → Actions):
+#   Secret   AWS_ROLE_ARN      role printed by cluster/github-oidc-aws.sh
+#   Secret   GHCR_PULL_TOKEN   classic PAT with only read:packages (lets EKS pull the private images)
+#   Variable ACM_CERT_ARN      the ACM certificate for railshack.nonsoikenwa.live (turns on HTTPS)
+# And an environment called production-eks (Settings → Environments).
+
+name: RailShack CI/CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Deploy this existing image tag instead of building (e.g. sha-1a2b3c4). Empty = build."
+        required: false
+        default: ""
+      build_all:
+        description: "Rebuild all 50 images, not just the changed ones"
+        type: boolean
+        default: false
+
+concurrency:
+  group: railshack-pipeline
+  cancel-in-progress: false      # never cancel a deploy halfway
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  EKS_CLUSTER: railshack
+  NAMESPACE: railshack
+  RELEASE: railshack
+  APP_DOMAIN: railshack.nonsoikenwa.live
+  REPLICAS: "2"
+  BUILD_LIMIT_SECONDS: "900"     # 15 minutes
+  REGISTRY: ghcr.io
+
+jobs:
+  # ---------------------------------------------------------------------------
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      started: ${{ steps.meta.outputs.started }}
+      tag: ${{ steps.meta.outputs.tag }}
+      owner: ${{ steps.meta.outputs.owner }}
+      changed: ${{ steps.plan.outputs.changed }}
+      unchanged: ${{ steps.plan.outputs.unchanged }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Release tag and start time
+        id: meta
+        run: |
+          echo "started=$(date +%s)" >> "$GITHUB_OUTPUT"
+          echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Which images changed?
+        id: plan
+        if: inputs.image_tag == ''
+        env:
+          BASE_SHA: ${{ github.event.before }}
+          BUILD_ALL: ${{ inputs.build_all && 'true' || 'false' }}
+        run: python3 scripts/ci/plan.py
+
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build · ${{ matrix.service }}
+    needs: plan
+    if: inputs.image_tag == '' && needs.plan.outputs.changed != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true              # one CRITICAL finding stops the other builds
+      max-parallel: 20
+      matrix:
+        service: ${{ fromJSON(needs.plan.outputs.changed) }}
+    env:
+      IMAGE: ghcr.io/${{ needs.plan.outputs.owner }}/railshack-${{ matrix.service }}
+      TAG: ${{ needs.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the image (amd64, for scanning)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: services/${{ matrix.service }}/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.IMAGE }}:scan
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+      - name: Trivy scan (fail on CRITICAL)
+        id: trivy
+        # Pinned to the commit of v0.36.0. Trivy's tags were hijacked in March 2026, so never use a bare tag here.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:scan
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: false      # true = only fail on CRITICALs that already have a fix
+          format: table
+          output: trivy-${{ matrix.service }}.txt
+
+      - name: Show the Trivy report
+        if: always() && steps.trivy.outcome != 'skipped'
+        run: cat "trivy-${{ matrix.service }}.txt" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Mark the pipeline as cut by Trivy
+        if: failure() && steps.trivy.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-critical-${{ matrix.service }}
+          path: trivy-${{ matrix.service }}.txt
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push the image (amd64 + arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: services/${{ matrix.service }}/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ env.TAG }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  # ---------------------------------------------------------------------------
+  retag:
+    name: Retag unchanged images
+    needs: [plan, build]
+    if: |
+      always() && inputs.image_tag == '' && needs.plan.result == 'success' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped') &&
+      needs.plan.outputs.unchanged != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Copy :latest to the release tag
+        env:
+          UNCHANGED: ${{ needs.plan.outputs.unchanged }}
+          OWNER: ${{ needs.plan.outputs.owner }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          for svc in $(echo "$UNCHANGED" | jq -r '.[]'); do
+            img="ghcr.io/$OWNER/railshack-$svc"
+            echo "↪ $img:latest → $TAG"
+            docker buildx imagetools create -t "$img:$TAG" "$img:latest" || {
+              echo "::error::$img:latest does not exist yet. Run this workflow once from the Actions tab with 'Rebuild all 50 images' ticked."
+              exit 1
+            }
+          done
+
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to EKS
+    needs: [plan, build, retag]
+    if: always() && needs.plan.result == 'success' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment:
+      name: production-eks
+      url: https://${{ env.APP_DOMAIN }}
+    permissions:
+      contents: read
+      id-token: write              # OIDC: GitHub hands AWS a short-lived token, no stored keys
+    env:
+      OWNER: ${{ needs.plan.outputs.owner }}
+      ACM_CERT_ARN: ${{ vars.ACM_CERT_ARN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1 ─────────────────────────────────────────────────────────────────────
+      - name: Look for Trivy findings
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: trivy-critical-*
+          path: trivy-findings
+
+      - name: "1 · Pick the tag"
+        id: pick
+        env:
+          MANUAL_TAG: ${{ inputs.image_tag }}
+          NEW_TAG: ${{ needs.plan.outputs.tag }}
+          STARTED: ${{ needs.plan.outputs.started }}
+          BUILD: ${{ needs.build.result }}
+          RETAG: ${{ needs.retag.result }}
+        run: |
+          elapsed=$(( $(date +%s) - STARTED ))
+          echo "Build result: $BUILD · retag: $RETAG · elapsed: $((elapsed / 60))m $((elapsed % 60))s"
+
+          if [ -n "$MANUAL_TAG" ]; then
+            echo "mode=release" >> "$GITHUB_OUTPUT"; echo "tag=$MANUAL_TAG" >> "$GITHUB_OUTPUT"
+            echo "▶ Manual deploy of $MANUAL_TAG"; exit 0
+          fi
+
+          if [ -d trivy-findings ] && [ -n "$(ls -A trivy-findings)" ]; then
+            echo "::error::Trivy found CRITICAL vulnerabilities. Pipeline cut, nothing deployed."
+            cat trivy-findings/*/*.txt 2>/dev/null || true
+            exit 1
+          fi
+
+          ok() { [ "$1" = success ] || [ "$1" = skipped ]; }
+          if ok "$BUILD" && ok "$RETAG"; then
+            echo "mode=release" >> "$GITHUB_OUTPUT"; echo "tag=$NEW_TAG" >> "$GITHUB_OUTPUT"
+            echo "▶ Deploying the new release $NEW_TAG"; exit 0
+          fi
+
+          if [ "$elapsed" -ge "$BUILD_LIMIT_SECONDS" ]; then
+            echo "mode=revert" >> "$GITHUB_OUTPUT"
+            echo "::warning::The build ran past 15 minutes. Dropping $NEW_TAG and reverting to the last stable release."
+            exit 0
+          fi
+
+          echo "::error::The build failed (not a timeout). Nothing deployed; the cluster keeps the current release."
+          exit 1
+
+      # 2 ─────────────────────────────────────────────────────────────────────
+      - name: "2 · Log in to AWS (OIDC, no stored keys)"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: railshack-deploy-${{ github.run_id }}
+
+      # 3 ─────────────────────────────────────────────────────────────────────
+      - name: "3 · Connect to EKS"
+        run: |
+          aws eks update-kubeconfig --name "$EKS_CLUSTER" --region "$AWS_REGION"
+          kubectl version
+          kubectl get nodes || true      # Auto Mode may show no nodes until pods are scheduled
+
+      - uses: azure/setup-helm@v4
+
+      - name: Resolve the last stable tag (revert only)
+        id: stable
+        if: steps.pick.outputs.mode == 'revert'
+        run: |
+          if ! helm status "$RELEASE" -n "$NAMESPACE" >/dev/null 2>&1; then
+            echo "::error::No release on the cluster yet, so there is no stable version to revert to."
+            exit 1
+          fi
+          tag=$(helm get values "$RELEASE" -n "$NAMESPACE" -o json | jq -r '.image.tag // empty')
+          [ -n "$tag" ] || { echo "::error::Could not read the image tag of the current release."; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "↩ Last stable release: $tag"
+
+      - name: Final tag
+        id: tag
+        run: |
+          echo "tag=${{ steps.stable.outputs.tag || steps.pick.outputs.tag }}" >> "$GITHUB_OUTPUT"
+          echo "### 🏷 Deploying \`${{ steps.stable.outputs.tag || steps.pick.outputs.tag }}\` (${{ steps.pick.outputs.mode }})" >> "$GITHUB_STEP_SUMMARY"
+
+      # 4 ─────────────────────────────────────────────────────────────────────
+      - name: "4 · Prepare the cluster: Prometheus + Grafana"
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update
+          helm upgrade --install monitoring prometheus-community/kube-prometheus-stack --version 93.4.0 \
+            -n monitoring --create-namespace -f cluster/monitoring-values.yaml \
+            --wait --timeout 10m
+
+      - name: "4 · Prepare the cluster: GHCR pull secret"
+        env:
+          GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
+        run: |
+          [ -n "$GHCR_PULL_TOKEN" ] || { echo "::error::Add the GHCR_PULL_TOKEN secret (classic PAT, read:packages)."; exit 1; }
+          kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create secret docker-registry ghcr-pull -n "$NAMESPACE" \
+            --docker-server=ghcr.io --docker-username="$OWNER" --docker-password="$GHCR_PULL_TOKEN" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      # 5 ─────────────────────────────────────────────────────────────────────
+      - name: "5 · Helm upgrade (rolls back on failure)"
+        id: helm
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          args=(
+            -f helm/railshack/values-eks.yaml
+            --set image.repository="$OWNER"
+            --set image.tag="$TAG"
+            --set defaults.replicas="$REPLICAS"
+            --set access.host="$APP_DOMAIN"
+            --set "imagePullSecrets[0].name=ghcr-pull"
+          )
+          [ -n "$ACM_CERT_ARN" ] && args+=(--set "access.alb.certificateArns[0]=$ACM_CERT_ARN")
+
+          helm lint helm/railshack "${args[@]}"
+          # --atomic: if anything is not healthy within 15 minutes, Helm rolls back by itself
+          helm upgrade --install "$RELEASE" helm/railshack -n "$NAMESPACE" --create-namespace \
+            "${args[@]}" --atomic --wait --timeout 15m --history-max 10
+          helm history "$RELEASE" -n "$NAMESPACE" --max 5
+
+      # 6 ─────────────────────────────────────────────────────────────────────
+      - name: "6 · Smoke test through the real ALB"
+        id: smoke
+        run: bash scripts/ci/smoke-remote.sh "$NAMESPACE"
+
+      - name: Roll back if the smoke test failed
+        if: failure() && steps.smoke.outcome == 'failure'
+        run: |
+          echo "::error::Smoke test failed on the new release. Rolling back."
+          helm rollback "$RELEASE" -n "$NAMESPACE" --wait --timeout 10m
+          helm history "$RELEASE" -n "$NAMESPACE" --max 5

@@ -1,0 +1,30 @@
+{
+    "Changes": [
+        {
+            "Action": "UPSERT",
+            "ResourceRecordSet": {
+                "Name": "_2fe140ab5e34f9552c3b99e7b0b91dce.railshack.nonsoikenwa.live.",
+                "Type": "CNAME",
+                "TTL": 300,
+                "ResourceRecords": [
+                    {
+                        "Value": "_e3e53cd458cae3d121f0b2cf17914d05.wzccmgtwzk.acm-validations.aws."
+                    }
+                ]
+            }
+        },
+        {
+            "Action": "UPSERT",
+            "ResourceRecordSet": {
+                "Name": "_398492393c85a63ea65c0725b67b1366.grafana.railshack.nonsoikenwa.live.",
+                "Type": "CNAME",
+                "TTL": 300,
+                "ResourceRecords": [
+                    {
+                        "Value": "_011aff41b1098a5c6f9875fdec510084.wzccmgtwzk.acm-validations.aws."
+                    }
+                ]
+            }
+        }
+    ]
+}
