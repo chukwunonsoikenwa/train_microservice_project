@@ -1,0 +1,4 @@
+{"Changes":[
+ {"Action":"UPSERT","ResourceRecordSet":{"Name":"railshack.nonsoikenwa.live","Type":"A","AliasTarget":{"HostedZoneId":"ZP97RAFLXTNZK","DNSName":"k8s-railshack-c38bb872f9-959194509.ap-south-1.elb.amazonaws.com","EvaluateTargetHealth":false}}},
+ {"Action":"UPSERT","ResourceRecordSet":{"Name":"grafana.railshack.nonsoikenwa.live","Type":"A","AliasTarget":{"HostedZoneId":"ZP97RAFLXTNZK","DNSName":"k8s-railshack-c38bb872f9-959194509.ap-south-1.elb.amazonaws.com","EvaluateTargetHealth":false}}}
+]}
